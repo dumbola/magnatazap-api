@@ -1,122 +1,168 @@
-import express from "express";
-import cors from "cors";
-import morgan from "morgan";
-import axios from "axios";
+// server.js — MagnataZap MD (Pair Code + QR + State)
+import 'dotenv/config';
+import express from 'express';
+import cors from 'cors';
+import morgan from 'morgan';
+import path from 'path';
+import fs from 'fs';
+import makeWASocket, {
+  fetchLatestBaileysVersion,
+  useMultiFileAuthState,
+  DisconnectReason
+} from '@whiskeysockets/baileys';
+
+const PORT = Number(process.env.PORT || 3000);
+const API_KEY = process.env.API_KEY || '';            // defina no Render/Railway
+const SESSIONS_DIR = process.env.SESSIONS_DIR || './sessions'; // defina se quiser
+
+// garante pasta de sessões
+fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 
 const app = express();
-app.use(cors({ origin: "*"}));
-app.use(express.json({ limit: "1mb" }));
-app.use(morgan("dev"));
+app.use(cors({ origin: '*' }));
+app.use(express.json({ limit: '1mb' }));
+app.use(morgan('dev'));
 
-const UP = process.env.UPSTREAM_BASE;     // ex.: http://188.245.202.11:1111
-const API_KEY = process.env.API_KEY;
+// opcional: exigir apikey no header
+app.use((req, res, next) => {
+  if (!API_KEY) return next();
+  const k = req.headers['apikey'] || req.headers['x-api-key'];
+  if (k !== API_KEY) return res.status(401).json({ ok:false, error:'unauthorized' });
+  next();
+});
 
-// helper para chamar upstream com header correto
-async function up(method, path, data, params) {
-  const url = `${UP}${path}`;
-  const r = await axios({
-    method, url, data, params,
-    headers: {
-      "Content-Type": "application/json",
-      apikey: API_KEY,
-      "x-api-key": API_KEY,
-      "Authorization": `Bearer ${API_KEY}`,
-    },
-    timeout: 20000,
-    validateStatus: () => true
+// ===== estado in-memory
+const instances = new Map(); // name -> { sock, state, lastQR, authDir, lastError }
+
+// util sleep
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// cria (ou retorna) uma instância Baileys
+async function ensureInstance(name) {
+  let it = instances.get(name);
+  if (it?.sock) return it;
+
+  const authDir = path.join(SESSIONS_DIR, name);
+  fs.mkdirSync(authDir, { recursive: true });
+  const { state, saveCreds } = await useMultiFileAuthState(authDir);
+  const { version } = await fetchLatestBaileysVersion();
+
+  const sock = makeWASocket({
+    version,
+    printQRInTerminal: false,
+    auth: state,
+    browser: ['MagnataZap', 'Chrome', '1.0'],
+    syncFullHistory: false,
+    logger: undefined
   });
-  return r;
+
+  // guarda QR quando o Baileys emitir
+  sock.ev.on('connection.update', (u) => {
+    const { connection, qr, lastDisconnect } = u;
+    const statusCode = lastDisconnect?.error?.output?.statusCode;
+    const isLogout = statusCode === DisconnectReason.loggedOut;
+
+    const prev = instances.get(name) || {};
+    instances.set(name, {
+      ...prev,
+      sock,
+      state: connection || prev.state || 'connecting',
+      lastQR: qr || null,
+      lastError: lastDisconnect?.error?.message || null,
+      authDir
+    });
+
+    if (isLogout) {
+      try { fs.rmSync(authDir, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  sock.ev.on('creds.update', saveCreds);
+
+  it = { sock, state: 'connecting', lastQR: null, lastError: null, authDir };
+  instances.set(name, it);
+  return it;
 }
 
-// --- Instâncias ---
-app.post("/instance/create", async (req, res) => {
-  const { instanceName, token } = req.body || {};
-  const body = { instanceName, token: token || instanceName };
-  const r = await up("post", "/instance/create", body);
-  return res.status(r.status).json(r.data);
-});
+// ===== rotas
 
-// OPEN com fallback de rotas (connection/open -> :name/open -> /instance/open)
-app.post("/instance/connection/open", async (req, res) => {
-  const { instanceName } = req.body || {};
-  const tries = [
-    { m:"post", p:"/instance/connection/open", body:{ instanceName } },
-    { m:"post", p:`/instance/${encodeURIComponent(instanceName)}/open`, body:{} },
-    { m:"get",  p:`/instance/${encodeURIComponent(instanceName)}/open`, body:null },
-    { m:"post", p:"/instance/open", body:{ instanceName } },
-    { m:"post", p:`/instance/${encodeURIComponent(instanceName)}/connect`, body:{} },
-    { m:"post", p:"/instance/connect", body:{ instanceName } },
-  ];
-  for (const t of tries) {
-    const r = await up(t.m, t.p, t.body);
-    if (r.status < 400) return res.status(200).json(r.data || { ok:true });
+// criar instância
+app.post('/instance/create', async (req, res) => {
+  try {
+    const { instanceName } = req.body || {};
+    if (!instanceName) return res.status(400).json({ ok:false, error:'instanceName obrigatório' });
+    await ensureInstance(instanceName);
+    return res.json({ ok:true, instanceName, status: 'connecting' });
+  } catch (e) {
+    return res.status(500).json({ ok:false, error: e?.message || 'erro' });
   }
-  return res.status(404).json({ ok:false, error:"Nenhuma rota OPEN aceita" });
 });
 
-// Pair por código (8 letras). Alguns provedores usam /pair, outros /connection/pairing/start
-app.post("/instance/:name/pair", async (req, res) => {
+// "open" (mantém compat com seu front; apenas garante que a instância existe)
+app.post('/instance/connection/open', async (req, res) => {
+  try {
+    const { instanceName } = req.body || {};
+    if (!instanceName) return res.status(400).json({ ok:false, error:'instanceName obrigatório' });
+    const it = await ensureInstance(instanceName);
+    return res.json({ ok:true, status: it.state || 'connecting' });
+  } catch (e) {
+    return res.status(500).json({ ok:false, error: e?.message || 'erro' });
+  }
+});
+
+// estado
+app.get('/instance/connection/state', (req, res) => {
+  const { instanceName } = req.query;
+  const it = instances.get(String(instanceName || ''));
+  return res.json({ ok:true, state: it?.state || 'close' });
+});
+
+// listar instâncias
+app.get('/instance/fetchInstances', (_req, res) => {
+  const list = [...instances.entries()].map(([instanceName, v]) => ({
+    instanceName, status: v.state || 'close'
+  }));
+  res.json(list);
+});
+
+// QR (fallback)
+app.get('/instance/:name/qr', async (req, res) => {
   const name = req.params.name;
-  const { phone } = req.body || {};
-  const payloads = [
-    { p:`/instance/${encodeURIComponent(name)}/pair`, body:{ phone } },
-    { p:`/instance/connection/pairing/start`, body:{ instanceName:name, phone } },
-    { p:`/instance/${encodeURIComponent(name)}/pairing/start`, body:{ phone } },
-  ];
-  for (const t of payloads) {
-    const r = await up("post", t.p, t.body);
-    if (r.status < 400 && (r.data?.code || r.data?.pairingCode)) {
-      const code = (r.data.code || r.data.pairingCode || "").toUpperCase();
-      const expiresIn = r.data.expiresIn ?? 60;
-      return res.json({ ok:true, code, expiresIn });
-    }
+  const it = await ensureInstance(name);
+
+  // aguarda alguns ciclos por um QR novo, se necessário
+  let tries = 0;
+  while (!it.lastQR && tries < 8) {
+    await sleep(500);
+    tries++;
   }
-  return res.status(400).json({ ok:false, error:"Falha ao gerar código de pareamento" });
+
+  if (!it.lastQR) return res.status(400).json({ ok:false, error:'QR indisponível' });
+  // devolve a string QR (cliente pode transformar em imagem)
+  return res.json({ ok:true, qr: it.lastQR });
 });
 
-// QR base64 (ou string)
-app.get("/instance/:name/qr", async (req, res) => {
-  const name = req.params.name;
-  const tries = [
-    { m:"get", p:`/instance/${encodeURIComponent(name)}/qr` },
-    { m:"get", p:`/instance/connection/qr`, params:{ instanceName:name, image:true } },
-  ];
-  for (const t of tries) {
-    const r = await up(t.m, t.p, null, t.params);
-    if (r.status < 400 && (r.data?.qr || r.data?.base64 || r.data?.image)) {
-      return res.json({ ok:true, qr: r.data.qr || r.data.base64 || r.data.image });
-    }
+// Pairing por código (8 letras) — REAL
+app.post('/instance/:name/pair', async (req, res) => {
+  try {
+    const name = req.params.name;
+    const { phone } = req.body || {};
+    if (!/^\d{12,15}$/.test(String(phone || '')))
+      return res.status(400).json({ ok:false, error:'phone E.164 sem + (ex: 554799999999)' });
+
+    const it = await ensureInstance(name);
+    const codeRaw = await it.sock.requestPairingCode(String(phone));
+    const clean = String(codeRaw).replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+    const code = clean.length === 8 ? clean : clean.slice(0, 8);
+
+    // Pair code expira rápido: informe no front para digitar em ~60s
+    return res.json({ ok:true, code, expiresIn: 60 });
+  } catch (e) {
+    return res.status(400).json({ ok:false, error: e?.message || 'falha ao gerar pairing code' });
   }
-  return res.status(400).json({ ok:false, error:"QR indisponível" });
 });
 
-// Estado
-app.get("/instance/connection/state", async (req, res) => {
-  const instanceName = req.query.instanceName;
-  const tries = [
-    { m:"get", p:`/instance/connection/state`, params:{ instanceName } },
-    { m:"get", p:`/instance/${encodeURIComponent(instanceName)}/state` },
-    { m:"get", p:`/instance/${encodeURIComponent(instanceName)}` },
-  ];
-  for (const t of tries) {
-    const r = await up(t.m, t.p, null, t.params);
-    if (r.status < 400) {
-      const state = r.data?.state || r.data?.status || r.data?.connectionStatus || "unknown";
-      return res.json({ ok:true, state });
-    }
-  }
-  return res.status(404).json({ ok:false, error:"state não disponível" });
-});
+// keepalive pro Render/Railway
+app.get('/keepalive', (_req, res) => res.json({ ok:true, ts: Date.now() }));
 
-// Lista instâncias
-app.get("/instance/fetchInstances", async (_req, res) => {
-  const r = await up("get", "/instance/fetchInstances");
-  if (r.status < 400) return res.json(r.data);
-  return res.status(r.status).json(r.data);
-});
-
-// keepalive simples
-app.get("/keepalive", (_req, res) => res.json({ ok:true, ts: Date.now() }));
-
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log("API ON:", PORT));
+app.listen(PORT, () => console.log('API ON:', PORT));

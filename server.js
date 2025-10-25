@@ -24,8 +24,7 @@ const logger = Pino({ level: "info" });
 
 // === PROXY (opcional) ===
 // DEFINA via env: PROXY_URL="http://user:pass@host:port"
-const PROXY_URL = process.env.PROXY_URL || "PROXY_URL = http://mYWpISo2:77UrzGi7@turbo-res.ipbr.pro:32403
-";
+const PROXY_URL = process.env.PROXY_URL || "PROXY_URL = http://uYOUSINk:34ddnAMp@185.14.238.24:6526";
 const AGENT = PROXY_URL ? new HttpsProxyAgent(PROXY_URL) : undefined;
 
 const SESSIONS_DIR = process.env.SESSIONS_DIR || path.join(process.cwd(), "sessions");

@@ -1,4 +1,5 @@
-// server.js — MagnataZap API (com +55 automático)
+// server.js — MagnataZap API (com proxy + +55 automático)
+import { HttpsProxyAgent } from "https-proxy-agent";
 import express from "express";
 import cors from "cors";
 import fs from "fs";
@@ -12,7 +13,7 @@ import Pino from "pino";
 const app = express();
 app.use(express.json());
 app.use(cors({
-  origin: true, // troque por "https://seu-dominio.com" se quiser travar
+  origin: true,
   methods: ["GET","POST","OPTIONS"],
   allowedHeaders: ["Content-Type","apikey","x-api-key"],
   maxAge: 600
@@ -21,11 +22,14 @@ app.options("*", cors());
 
 const logger = Pino({ level: "info" });
 
-// Sessões (Hostinger: mantenha dentro do app pra persistir)
+// === PROXY (opcional) ===
+// DEFINA via env: PROXY_URL="http://user:pass@host:port"
+const PROXY_URL = process.env.PROXY_URL || "";
+const AGENT = PROXY_URL ? new HttpsProxyAgent(PROXY_URL) : undefined;
+
 const SESSIONS_DIR = process.env.SESSIONS_DIR || path.join(process.cwd(), "sessions");
 fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 
-// (opcional) API Key
 const API_KEY = process.env.API_KEY || "";
 if (API_KEY) {
   app.use((req, res, next) => {
@@ -38,14 +42,13 @@ if (API_KEY) {
 const INST = new Map(); // instanceName -> { sock, state, lastError, version }
 const delay = (ms) => new Promise(r => setTimeout(r, ms));
 
-// +55 automático (assume BR se não vier DDI)
-// Ex.: "47997394479" -> "5547997394479"; "5547997394479" mantém.
+// +55 automático para BR
 function normalizePhoneBR(input) {
   const d = String(input || "").replace(/\D+/g, "");
   if (!d) return "";
-  if (/^55\d{10,13}$/.test(d)) return d;       // já está com 55
-  if (/^\d{10,11}$/.test(d)) return "55" + d;  // DDD+número
-  return d; // não mexe em outros formatos (ex.: outro país com DDI)
+  if (/^55\d{10,13}$/.test(d)) return d;      // já com 55
+  if (/^\d{10,11}$/.test(d)) return "55" + d; // DDD+número
+  return d; // outros países, mantém
 }
 
 async function ensureSock(instanceName = "default") {
@@ -62,9 +65,13 @@ async function ensureSock(instanceName = "default") {
     version,
     auth: state,
     printQRInTerminal: false,
-    browser: ["MagnataZap", "Chrome", "1.0"],
+    browser: ["Windows","Chrome","120"], // UA "humano"
     markOnlineOnConnect: false,
-    logger
+    logger,
+
+    // >>> aplique o PROXY aqui (HTTP/HTTPS + WSS)
+    fetchOptions: AGENT ? { agent: AGENT } : undefined,
+    connectOptions: AGENT ? { agent: AGENT } : undefined
   });
 
   it = { sock, state: "connecting", lastError: null, version };
@@ -103,11 +110,12 @@ app.get("/diag", (req, res) => {
     lastError: it?.lastError || null,
     wa_web_version: it?.version || null,
     uptime_seconds: Math.round(process.uptime()),
-    now: new Date().toISOString()
+    now: new Date().toISOString(),
+    proxy: Boolean(AGENT)
   });
 });
 
-// Pareamento por código (8 letras) — aceita número sem 55
+// Pareamento por CÓDIGO (8 chars) — aceita número sem 55
 app.post("/pair", async (req, res) => {
   try {
     const { instanceName = "default" } = req.body || {};
@@ -138,6 +146,7 @@ app.post("/pair", async (req, res) => {
       });
     }
 
+    // pede o código com 1 retry se "Connection Closed"
     let raw, lastErr = null;
     for (let t = 0; t < 2; t++) {
       try {
@@ -160,18 +169,20 @@ app.post("/pair", async (req, res) => {
       });
     }
 
-    const clean = String(raw).replace(/[^A-Za-z0-9]/g, "").toUpperCase();
-    const code8 = clean.slice(0, 8);
-    if (code8.length !== 8) {
+    const rawCode = String(raw);
+    const compact = rawCode.replace(/[^A-Za-z0-9]/g, "").toUpperCase();
+    const code8 = compact.slice(0, 8);
+    if (code8.length < 6) {
       return res.status(502).json({
         ok:false,
-        error:"pareamento não retornou 8 letras",
+        error:"pareamento não retornou código válido",
         state: it.state,
-        lastError: it.lastError
+        lastError: it.lastError,
+        rawCode
       });
     }
 
-    res.json({ ok:true, code: code8, expiresIn: 60, state: it.state });
+    res.json({ ok:true, code: code8, rawCode, expiresIn: 60, state: it.state });
   } catch (e) {
     res.status(500).json({ ok:false, error: String(e?.message || e) });
   }

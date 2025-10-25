@@ -4,6 +4,7 @@ import cors from 'cors';
 import fs from 'fs-extra';
 import path from 'path';
 import { makeWASocket, useMultiFileAuthState } from '@whiskeysockets/baileys';
+app.get('/keepalive', (_req,res) => res.json({ ok:true, t: Date.now() }));
 
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || '';

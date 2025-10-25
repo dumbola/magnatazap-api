@@ -1,14 +1,14 @@
+// server.js — MagnataZap API (PIN + QR + KeepAlive)
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import fs from 'fs-extra';
 import path from 'path';
 import { makeWASocket, useMultiFileAuthState } from '@whiskeysockets/baileys';
-app.get('/keepalive', (_req,res) => res.json({ ok:true, t: Date.now() }));
 
-const PORT = process.env.PORT || 3000;
-const API_KEY = process.env.API_KEY || '';
-const SESSIONS_DIR = process.env.SESSIONS_DIR || './sessions';
+const PORT         = process.env.PORT || 3000;
+const API_KEY      = process.env.API_KEY || '';                 // defina no Render
+const SESSIONS_DIR = process.env.SESSIONS_DIR || './sessions';  // defina no Render
 
 await fs.ensureDir(SESSIONS_DIR);
 
@@ -16,7 +16,7 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '8mb' }));
 
-// Auth simples por header
+// 🔐 Header simples de API Key
 app.use((req, res, next) => {
   if (API_KEY && req.headers['apikey'] !== API_KEY) {
     return res.status(401).json({ ok: false, error: 'unauthorized' });
@@ -24,10 +24,10 @@ app.use((req, res, next) => {
   next();
 });
 
+// ===== core =====
 const instances = new Map();
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-// cria (ou recria) uma instância
 async function createInstance(name) {
   const dir = path.join(SESSIONS_DIR, name);
   await fs.ensureDir(dir);
@@ -54,7 +54,6 @@ async function createInstance(name) {
   return meta;
 }
 
-// devolve instância viva; se caiu, recria
 async function getInstance(name, { forceNew = false } = {}) {
   if (forceNew || !instances.has(name)) return createInstance(name);
   const meta = instances.get(name);
@@ -64,59 +63,61 @@ async function getInstance(name, { forceNew = false } = {}) {
   return meta;
 }
 
-/* ---- Endpoints ---- */
+// ===== endpoints =====
 
-// health
-app.get('/health', (_req, res) => res.json({ ok:true, up:true }));
+// ping/saúde + keepalive (mantém a instância acordada no plano Free)
+app.get('/health', (_req, res) => res.json({ ok: true, up: true }));
+app.get('/keepalive', (_req, res) => res.json({ ok: true, t: Date.now() }));
 
-// criar instância
+// cria/garante instância
 app.post('/instance/create', async (req, res) => {
   try {
-    const name = req.body.instanceName?.trim() || 'inst-' + Date.now();
+    const name = (req.body.instanceName || '').trim() || 'inst-' + Date.now();
     const meta = await getInstance(name);
-    return res.json({ ok:true, instanceName:name, status: meta.status });
+    return res.json({ ok: true, instanceName: name, status: meta.status });
   } catch (e) {
     console.error('[CREATE]', e);
-    return res.status(500).json({ ok:false, error: e?.message || String(e) });
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 });
 
-// gerar código PIN de pareamento
+// gera PIN (pareamento por número)
 app.post('/instance/:name/pair', async (req, res) => {
   try {
-    const phone = (req.body?.phone || '').replace(/\D/g,'');
+    const phone = (req.body?.phone || '').replace(/\D/g, '');
     if (!/^55\d{10,11}$/.test(phone)) {
-      return res.status(400).json({ ok:false, error:'Formato inválido. Use 55 + DDD + número (ex.: 5547999999999).' });
+      return res.status(400).json({ ok: false, error: 'Formato inválido. Use 55 + DDD + número (ex.: 5547999999999).' });
     }
+
     const name = req.params.name;
     let meta = await getInstance(name);
-
     await sleep(500);
+
     let code;
     try {
       code = await meta.sock.requestPairingCode(phone);
     } catch (err) {
       console.error('[PAIR-TRY1]', err?.message || err);
-      meta = await getInstance(name, { forceNew:true });
+      meta = await getInstance(name, { forceNew: true });
       await sleep(700);
       code = await meta.sock.requestPairingCode(phone);
     }
-    return res.json({ ok:true, pairingCode: String(code).toUpperCase() });
+    return res.json({ ok: true, pairingCode: String(code).toUpperCase() });
   } catch (e) {
     console.error('[PAIR-FATAL]', e);
-    return res.status(500).json({ ok:false, error: e?.message || String(e) });
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 });
 
-// QR fallback (caso o app não aceite PIN)
+// QR fallback (mostra QR atual da sessão)
 app.get('/instance/:name/qr', async (req, res) => {
   try {
     const name = req.params.name;
     const meta = await getInstance(name);
-    return res.json({ ok:true, qr: meta.lastQR || null, status: meta.status });
+    return res.json({ ok: true, qr: meta.lastQR || null, status: meta.status });
   } catch (e) {
     console.error('[QR]', e);
-    return res.status(500).json({ ok:false, error: e?.message || String(e) });
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 });
 
@@ -124,21 +125,21 @@ app.get('/instance/:name/qr', async (req, res) => {
 app.post('/instance/:name/send', async (req, res) => {
   try {
     const name = req.params.name;
-    const to = (req.body?.to || '').replace(/\D/g,'');
+    const to   = (req.body?.to || '').replace(/\D/g, '');
     const text = (req.body?.text || '').toString();
-    if (!/^55\d{10,11}$/.test(to)) return res.status(400).json({ ok:false, error:'Destino inválido (use 55 + DDD + número).' });
+    if (!/^55\d{10,11}$/.test(to)) return res.status(400).json({ ok: false, error: 'Destino inválido (use 55 + DDD + número).' });
 
     const meta = await getInstance(name);
     const jid = `${to}@s.whatsapp.net`;
     const r = await meta.sock.sendMessage(jid, { text });
-    return res.json({ ok:true, id: r?.key?.id || null });
+    return res.json({ ok: true, id: r?.key?.id || null });
   } catch (e) {
     console.error('[SEND]', e);
-    return res.status(500).json({ ok:false, error: e?.message || String(e) });
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 });
 
-// listar instâncias
+// status das instâncias
 app.get('/instance/fetchInstances', (_req, res) => {
   const arr = [...instances.entries()].map(([name, m]) => ({
     instanceName: name, status: m.status, lastError: m.lastError || null

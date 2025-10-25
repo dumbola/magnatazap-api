@@ -1,219 +1,117 @@
-// server.js — MagnataZap API (com proxy + +55 automático)
-import { HttpsProxyAgent } from "https-proxy-agent";
-import express from "express";
-import cors from "cors";
-import fs from "fs";
-import path from "path";
-import makeWASocket, {
-  fetchLatestBaileysVersion,
-  useMultiFileAuthState
-} from "@whiskeysockets/baileys";
-import Pino from "pino";
-
-const app = express();
-app.use(express.json());
-app.use(cors({
-  origin: true,
-  methods: ["GET","POST","OPTIONS"],
-  allowedHeaders: ["Content-Type","apikey","x-api-key"],
-  maxAge: 600
-}));
-app.options("*", cors());
-
-const logger = Pino({ level: "info" });
-
-// === PROXY (opcional) ===
-// DEFINA via env: PROXY_URL="http://user:pass@host:port"
-const PROXY_URL = process.env.PROXY_URL || "PROXY_URL = http://uYOUSINk:34ddnAMp@185.14.238.24:6526";
-const AGENT = PROXY_URL ? new HttpsProxyAgent(PROXY_URL) : undefined;
-// server.js
+// server.js — API Express com /pair (pareamento por código), logs e /health
 const express = require('express');
-const logger = require('./logger');
-const requestContext = require('./requestContext');
+const { getFreshSession } = require('./sessions');
 
 const app = express();
 app.disable('x-powered-by');
-
 app.use(express.json({ limit: '256kb' }));
-app.use(requestContext(logger));
 
-// ——— sua rota /pair aqui embaixo ———
-app.use(require('./routes/pair'));
+// Log simples (sem libs), aparece no console/render logs
+app.use((req, res, next) => {
+  const t0 = Date.now();
+  const digits = String(req.body?.phone || '').replace(/\D/g, '');
+  const masked = digits ? (digits.slice(0, 2) + '****' + digits.slice(-2)) : undefined;
 
-// 404
-app.use((req, res) => {
-  req.log.warn({ path: req.originalUrl }, 'not_found');
-  res.status(404).json({ ok: false, error: 'not_found' });
-});
+  console.log(JSON.stringify({
+    level: 'debug',
+    msg: 'request_in',
+    method: req.method,
+    path: req.originalUrl || req.url,
+    body: { instanceName: req.body?.instanceName, phone_masked: masked },
+    origin: req.headers.origin
+  }));
 
-// erro global
-app.use((err, req, res, next) => {
-  req.log.error({ err }, 'unhandled_error');
-  res.status(500).json({ ok: false, error: 'internal_error' });
-});
-
-const port = process.env.PORT || 3000;
-app.listen(port, () => logger.info({ port }, 'api_up'));
-
-const SESSIONS_DIR = process.env.SESSIONS_DIR || path.join(process.cwd(), "sessions");
-fs.mkdirSync(SESSIONS_DIR, { recursive: true });
-
-const API_KEY = process.env.API_KEY || "";
-if (API_KEY) {
-  app.use((req, res, next) => {
-    const k = req.headers["apikey"] || req.headers["x-api-key"];
-    if (k !== API_KEY) return res.status(401).json({ ok:false, error:"unauthorized" });
-    next();
+  res.on('finish', () => {
+    console.log(JSON.stringify({
+      level: 'info',
+      msg: 'request_out',
+      path: req.originalUrl || req.url,
+      statusCode: res.statusCode,
+      durMs: Date.now() - t0
+    }));
   });
+
+  next();
+});
+
+// Healthcheck
+app.get('/health', (req, res) => res.status(200).json({ ok: true, status: 'up' }));
+
+// Utilidades
+function normalizePhoneDigitsBR(phone) {
+  const d = String(phone || '').replace(/\D/g, '');
+  return d.startsWith('55') ? d : ('55' + d);
 }
 
-const INST = new Map(); // instanceName -> { sock, state, lastError, version }
-const delay = (ms) => new Promise(r => setTimeout(r, ms));
-
-// +55 automático para BR
-function normalizePhoneBR(input) {
-  const d = String(input || "").replace(/\D+/g, "");
-  if (!d) return "";
-  if (/^55\d{10,13}$/.test(d)) return d;      // já com 55
-  if (/^\d{10,11}$/.test(d)) return "55" + d; // DDD+número
-  return d; // outros países, mantém
-}
-
-async function ensureSock(instanceName = "default") {
-  let it = INST.get(instanceName);
-  if (it?.sock) return it;
-
-  const authDir = path.join(SESSIONS_DIR, instanceName);
-  fs.mkdirSync(authDir, { recursive: true });
-
-  const { state, saveCreds } = await useMultiFileAuthState(authDir);
-  const { version } = await fetchLatestBaileysVersion();
-
-  const sock = makeWASocket({
-    version,
-    auth: state,
-    printQRInTerminal: false,
-    browser: ["Windows","Chrome","120"], // UA "humano"
-    markOnlineOnConnect: false,
-    logger,
-
-    // >>> aplique o PROXY aqui (HTTP/HTTPS + WSS)
-    fetchOptions: AGENT ? { agent: AGENT } : undefined,
-    connectOptions: AGENT ? { agent: AGENT } : undefined
-  });
-
-  it = { sock, state: "connecting", lastError: null, version };
-  INST.set(instanceName, it);
-
-  sock.ev.on("creds.update", saveCreds);
-  sock.ev.on("connection.update", (u) => {
-    if (u.connection) {
-      it.state = u.connection; // open | close | connecting
-      logger.info({ instanceName, state: it.state }, "connection.update");
-    }
-    if (u.lastDisconnect?.error) {
-      const msg = String(u.lastDisconnect.error?.message || u.lastDisconnect.error);
-      it.lastError = msg;
-      logger.warn({ instanceName, err: msg }, "lastDisconnect");
-    }
-  });
-
-  return it;
-}
-
-// Health/diag
-app.get("/", (_req, res) => res.json({ ok:true, service:"magnatazap-api" }));
-app.get("/state", (req, res) => {
-  const name = String(req.query.instanceName || "default");
-  const it = INST.get(name);
-  res.json({ ok:true, state: it?.state || "close", lastError: it?.lastError || null });
-});
-app.get("/diag", (req, res) => {
-  const name = String(req.query.instanceName || "default");
-  const it = INST.get(name);
-  res.json({
-    ok: true,
-    instanceName: name,
-    state: it?.state || "close",
-    lastError: it?.lastError || null,
-    wa_web_version: it?.version || null,
-    uptime_seconds: Math.round(process.uptime()),
-    now: new Date().toISOString(),
-    proxy: Boolean(AGENT)
-  });
-});
-
-// Pareamento por CÓDIGO (8 chars) — aceita número sem 55
-app.post("/pair", async (req, res) => {
+// POST /pair — gera código oficial de pareamento (WhatsApp Business)
+// body: { instanceName: string, phone: "55DDDNUMERO" (só dígitos; sem "+") }
+app.post('/pair', async (req, res) => {
+  const t0 = Date.now();
   try {
-    const { instanceName = "default" } = req.body || {};
-    const phone = normalizePhoneBR(req.body?.phone);
+    const { instanceName, phone } = req.body || {};
+    const instance = String(instanceName || '').trim();
+    const phoneDigits = normalizePhoneDigitsBR(phone);
 
-    if (!/^\d{12,15}$/.test(phone || "")) {
-      return res.status(400).json({ ok:false, error:"phone inválido (E.164 sem '+'). Ex.: 554799999999" });
+    if (!instance || !/^[A-Za-z0-9._-]{3,64}$/.test(instance)) {
+      console.log(JSON.stringify({ level: 'warn', msg: 'pair_invalid_instance', instance }));
+      return res.status(422).json({ ok: false, error: 'invalid_instanceName' });
+    }
+    if (!/^\d{12,15}$/.test(phoneDigits)) {
+      console.log(JSON.stringify({ level: 'warn', msg: 'pair_invalid_phone', phone_masked: `**${phoneDigits.slice(-4)}` }));
+      return res.status(422).json({ ok: false, error: 'invalid_phone' });
     }
 
-    let it = await ensureSock(instanceName);
+    // Cria sessão "fresh" e solicita o código de pareamento
+    const sock = await getFreshSession(instance, (line) => console.log(line));
 
-    if (it.state === "close" || !it.sock) {
-      try { it.sock?.end?.(); } catch {}
-      INST.delete(instanceName);
-      it = await ensureSock(instanceName);
-    }
-
-    for (let i = 0; i < 25; i++) {
-      if (it.state && it.state !== "close") break;
-      await delay(300);
-    }
-    if (!it.state || it.state === "close") {
-      return res.status(503).json({
-        ok:false,
-        error:"instância indisponível (state=close). Tente novamente.",
-        state: it?.state || "close",
-        lastError: it?.lastError || null
-      });
+    // IMPORTANTE: requestPairingCode exige número em E.164 sem '+'
+    let code;
+    try {
+      code = await sock.requestPairingCode(phoneDigits);
+    } catch (err) {
+      // se der "already registered" por algum motivo, força refresh novamente
+      console.log(JSON.stringify({ level: 'warn', msg: 'request_pairing_retry', err: String(err) }));
+      const fresh = await getFreshSession(instance, (line) => console.log(line));
+      code = await fresh.requestPairingCode(phoneDigits);
     }
 
-    // pede o código com 1 retry se "Connection Closed"
-    let raw, lastErr = null;
-    for (let t = 0; t < 2; t++) {
-      try {
-        logger.info({ instanceName, phone }, "requestPairingCode()");
-        raw = await it.sock.requestPairingCode(phone);
-        break;
-      } catch (e) {
-        lastErr = String(e?.message || e);
-        logger.warn({ instanceName, err: lastErr }, "requestPairingCode error");
-        if (!/Connection Closed/i.test(lastErr)) break;
-        await delay(600);
-      }
-    }
-    if (!raw) {
-      return res.status(500).json({
-        ok:false,
-        error: lastErr || "falha ao gerar pairing code",
-        state: it.state,
-        lastError: it.lastError
-      });
-    }
+    const expiresIn = 60; // segundos (valor típico)
 
-    const rawCode = String(raw);
-    const compact = rawCode.replace(/[^A-Za-z0-9]/g, "").toUpperCase();
-    const code8 = compact.slice(0, 8);
-    if (code8.length < 6) {
-      return res.status(502).json({
-        ok:false,
-        error:"pareamento não retornou código válido",
-        state: it.state,
-        lastError: it.lastError,
-        rawCode
-      });
-    }
+    console.log(JSON.stringify({
+      level: 'info',
+      msg: 'pair_code_generated',
+      instanceName: instance,
+      phone_tail: phoneDigits.slice(-4),
+      code,
+      expiresIn
+    }));
 
-    res.json({ ok:true, code: code8, rawCode, expiresIn: 60, state: it.state });
-  } catch (e) {
-    res.status(500).json({ ok:false, error: String(e?.message || e) });
+    // devolve já o código para o cliente
+    res.status(200).json({ ok: true, code, expiresIn, state: 'connecting' });
+
+    // Mantém a sessão viva por ~70s (janela de pareamento)
+    setTimeout(() => {
+      const dur = Date.now() - t0;
+      console.log(JSON.stringify({
+        level: 'debug',
+        msg: 'pair_watchdog_tick_60s',
+        instanceName: instance,
+        durMs: dur
+      }));
+      // (opcional) encerrar depois do TTL para liberar recursos:
+      // try { sock?.end?.(); } catch {}
+    }, 70000).unref();
+
+  } catch (err) {
+    console.error(JSON.stringify({ level: 'error', msg: 'pair_error', err: String(err) }));
+    return res.status(500).json({ ok: false, error: 'internal_error' });
   }
 });
 
-app.listen(process.env.PORT || 3000, () => console.log("API ON"));
+// 404
+app.use((req, res) => res.status(404).json({ ok: false, error: 'not_found' }));
+
+const port = process.env.PORT || 3000;
+app.listen(port, () => {
+  console.log(JSON.stringify({ level: 'info', msg: 'api_up', port }));
+});

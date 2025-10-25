@@ -1,4 +1,3 @@
-// server.js — API Express com /pair (pareamento por código), logs e /health
 const express = require('express');
 const { getFreshSession } = require('./sessions');
 
@@ -6,45 +5,76 @@ const app = express();
 app.disable('x-powered-by');
 app.use(express.json({ limit: '256kb' }));
 
-// Log simples (sem libs), aparece no console/render logs
+// log básico
 app.use((req, res, next) => {
   const t0 = Date.now();
   const digits = String(req.body?.phone || '').replace(/\D/g, '');
-  const masked = digits ? (digits.slice(0, 2) + '****' + digits.slice(-2)) : undefined;
+  const masked = digits ? (digits.slice(0,2) + '****' + digits.slice(-2)) : undefined;
 
   console.log(JSON.stringify({
-    level: 'debug',
-    msg: 'request_in',
-    method: req.method,
-    path: req.originalUrl || req.url,
-    body: { instanceName: req.body?.instanceName, phone_masked: masked },
-    origin: req.headers.origin
+    level:'debug', msg:'request_in', method:req.method, path:req.originalUrl || req.url,
+    body:{ instanceName:req.body?.instanceName, phone_masked: masked }
   }));
 
   res.on('finish', () => {
     console.log(JSON.stringify({
-      level: 'info',
-      msg: 'request_out',
-      path: req.originalUrl || req.url,
-      statusCode: res.statusCode,
-      durMs: Date.now() - t0
+      level:'info', msg:'request_out',
+      path:req.originalUrl || req.url, statusCode:res.statusCode, durMs: Date.now()-t0
     }));
   });
-
   next();
 });
 
-// Healthcheck
-app.get('/health', (req, res) => res.status(200).json({ ok: true, status: 'up' }));
+app.get('/health', (req,res)=> res.status(200).json({ ok:true, status:'up' }));
 
-// Utilidades
 function normalizePhoneDigitsBR(phone) {
   const d = String(phone || '').replace(/\D/g, '');
-  return d.startsWith('55') ? d : ('55' + d);
+  return d.startsWith('55') ? d : '55' + d;
+}
+
+const TRANSIENT_ERR = /Connection\s+(Closed|Failure)|timed\s*out|WS_CLOSE|socket/i;
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+async function getPairCodeWithRetry(instance, phoneDigits) {
+  const maxAttempts = 4;           // total ~ (0.4 + 0.8 + 1.2 + 1.6)s + overhead
+  const baseDelay  = 400;          // ms
+  let lastErr;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    console.log(JSON.stringify({ level:'debug', msg:'pair_attempt', instance, attempt }));
+
+    // cria sessão fresh a cada tentativa (evita estado sujo)
+    const sock = await getFreshSession(instance, (line) => console.log(line));
+
+    try {
+      const code = await sock.requestPairingCode(phoneDigits);
+      if (typeof code === 'string' && code.trim()) {
+        console.log(JSON.stringify({ level:'info', msg:'pair_code_generated', instanceName:instance, phone_tail:phoneDigits.slice(-4), code, attempt }));
+        return code.trim().toUpperCase();
+      }
+      throw new Error('empty_code');
+    } catch (err) {
+      lastErr = err;
+      const errStr = String(err || '');
+      console.log(JSON.stringify({ level:'warn', msg:'pair_attempt_error', instance, attempt, err: errStr }));
+
+      // se for erro transitório, backoff e tenta de novo
+      if (TRANSIENT_ERR.test(errStr)) {
+        const wait = baseDelay * attempt;
+        await sleep(wait);
+        continue;
+      }
+      // erro não transitório — sai
+      break;
+    }
+  }
+
+  const detail = String(lastErr || 'unknown_error');
+  throw new Error(`pair_failed_after_retries: ${detail}`);
 }
 
 // POST /pair — gera código oficial de pareamento (WhatsApp Business)
-// body: { instanceName: string, phone: "55DDDNUMERO" (só dígitos; sem "+") }
 app.post('/pair', async (req, res) => {
   const t0 = Date.now();
   try {
@@ -53,65 +83,36 @@ app.post('/pair', async (req, res) => {
     const phoneDigits = normalizePhoneDigitsBR(phone);
 
     if (!instance || !/^[A-Za-z0-9._-]{3,64}$/.test(instance)) {
-      console.log(JSON.stringify({ level: 'warn', msg: 'pair_invalid_instance', instance }));
-      return res.status(422).json({ ok: false, error: 'invalid_instanceName' });
+      console.log(JSON.stringify({ level:'warn', msg:'pair_invalid_instance', instance }));
+      return res.status(422).json({ ok:false, error:'invalid_instanceName' });
     }
     if (!/^\d{12,15}$/.test(phoneDigits)) {
-      console.log(JSON.stringify({ level: 'warn', msg: 'pair_invalid_phone', phone_masked: `**${phoneDigits.slice(-4)}` }));
-      return res.status(422).json({ ok: false, error: 'invalid_phone' });
+      console.log(JSON.stringify({ level:'warn', msg:'pair_invalid_phone', phone_masked:`**${phoneDigits.slice(-4)}` }));
+      return res.status(422).json({ ok:false, error:'invalid_phone' });
     }
 
-    // Cria sessão "fresh" e solicita o código de pareamento
-    const sock = await getFreshSession(instance, (line) => console.log(line));
+    // tenta com retry/backoff
+    const code = await getPairCodeWithRetry(instance, phoneDigits);
 
-    // IMPORTANTE: requestPairingCode exige número em E.164 sem '+'
-    let code;
-    try {
-      code = await sock.requestPairingCode(phoneDigits);
-    } catch (err) {
-      // se der "already registered" por algum motivo, força refresh novamente
-      console.log(JSON.stringify({ level: 'warn', msg: 'request_pairing_retry', err: String(err) }));
-      const fresh = await getFreshSession(instance, (line) => console.log(line));
-      code = await fresh.requestPairingCode(phoneDigits);
-    }
+    const expiresIn = 60;
+    // devolve já
+    res.status(200).json({ ok:true, code, expiresIn, state:'connecting' });
 
-    const expiresIn = 60; // segundos (valor típico)
-
-    console.log(JSON.stringify({
-      level: 'info',
-      msg: 'pair_code_generated',
-      instanceName: instance,
-      phone_tail: phoneDigits.slice(-4),
-      code,
-      expiresIn
-    }));
-
-    // devolve já o código para o cliente
-    res.status(200).json({ ok: true, code, expiresIn, state: 'connecting' });
-
-    // Mantém a sessão viva por ~70s (janela de pareamento)
+    // watchdog ~60s
     setTimeout(() => {
-      const dur = Date.now() - t0;
-      console.log(JSON.stringify({
-        level: 'debug',
-        msg: 'pair_watchdog_tick_60s',
-        instanceName: instance,
-        durMs: dur
-      }));
-      // (opcional) encerrar depois do TTL para liberar recursos:
-      // try { sock?.end?.(); } catch {}
+      console.log(JSON.stringify({ level:'debug', msg:'pair_watchdog_tick_60s', instanceName:instance, durMs: Date.now()-t0 }));
     }, 70000).unref();
 
   } catch (err) {
-    console.error(JSON.stringify({ level: 'error', msg: 'pair_error', err: String(err) }));
-    return res.status(500).json({ ok: false, error: 'internal_error' });
+    console.error(JSON.stringify({ level:'error', msg:'pair_error', err:String(err), stack: err?.stack }));
+    // Enquanto debugamos, devolve detalhe pra você ver do cliente:
+    return res.status(500).json({ ok:false, error:'internal_error', detail: String(err) });
   }
 });
 
-// 404
-app.use((req, res) => res.status(404).json({ ok: false, error: 'not_found' }));
+app.use((req,res)=> res.status(404).json({ ok:false, error:'not_found' }));
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => {
-  console.log(JSON.stringify({ level: 'info', msg: 'api_up', port }));
+app.listen(port, '0.0.0.0', () => {
+  console.log(JSON.stringify({ level:'info', msg:'api_up', port }));
 });

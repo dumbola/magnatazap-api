@@ -26,6 +26,34 @@ const logger = Pino({ level: "info" });
 // DEFINA via env: PROXY_URL="http://user:pass@host:port"
 const PROXY_URL = process.env.PROXY_URL || "PROXY_URL = http://uYOUSINk:34ddnAMp@185.14.238.24:6526";
 const AGENT = PROXY_URL ? new HttpsProxyAgent(PROXY_URL) : undefined;
+// server.js
+const express = require('express');
+const logger = require('./logger');
+const requestContext = require('./requestContext');
+
+const app = express();
+app.disable('x-powered-by');
+
+app.use(express.json({ limit: '256kb' }));
+app.use(requestContext(logger));
+
+// ——— sua rota /pair aqui embaixo ———
+app.use(require('./routes/pair'));
+
+// 404
+app.use((req, res) => {
+  req.log.warn({ path: req.originalUrl }, 'not_found');
+  res.status(404).json({ ok: false, error: 'not_found' });
+});
+
+// erro global
+app.use((err, req, res, next) => {
+  req.log.error({ err }, 'unhandled_error');
+  res.status(500).json({ ok: false, error: 'internal_error' });
+});
+
+const port = process.env.PORT || 3000;
+app.listen(port, () => logger.info({ port }, 'api_up'));
 
 const SESSIONS_DIR = process.env.SESSIONS_DIR || path.join(process.cwd(), "sessions");
 fs.mkdirSync(SESSIONS_DIR, { recursive: true });

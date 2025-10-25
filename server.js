@@ -1,5 +1,4 @@
-// server.js — MagnataZap (tudo-em-um)
-// Requisitos no package.json: express, cors, pino, @whiskeysockets/baileys
+// server.js — MagnataZap API (com +55 automático)
 import express from "express";
 import cors from "cors";
 import fs from "fs";
@@ -10,27 +9,23 @@ import makeWASocket, {
 } from "@whiskeysockets/baileys";
 import Pino from "pino";
 
-/* ============ APP & MIDDLEWARES ============ */
 const app = express();
 app.use(express.json());
-
 app.use(cors({
-  origin: true,                        // troque por "https://seu-dominio.com" se quiser travar
+  origin: true, // troque por "https://seu-dominio.com" se quiser travar
   methods: ["GET","POST","OPTIONS"],
   allowedHeaders: ["Content-Type","apikey","x-api-key"],
   maxAge: 600
 }));
 app.options("*", cors());
 
-/* ============ CONFIG ============ */
-// logger do Baileys (info p/ ver nos logs do Render)
 const logger = Pino({ level: "info" });
 
-// onde salvar sessão (Render: use /tmp/sessions)
-const SESSIONS_DIR = process.env.SESSIONS_DIR || "./sessions";
+// Sessões (Hostinger: mantenha dentro do app pra persistir)
+const SESSIONS_DIR = process.env.SESSIONS_DIR || path.join(process.cwd(), "sessions");
 fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 
-// (opcional) proteção por chave
+// (opcional) API Key
 const API_KEY = process.env.API_KEY || "";
 if (API_KEY) {
   app.use((req, res, next) => {
@@ -40,9 +35,18 @@ if (API_KEY) {
   });
 }
 
-/* ============ CORE ============ */
 const INST = new Map(); // instanceName -> { sock, state, lastError, version }
 const delay = (ms) => new Promise(r => setTimeout(r, ms));
+
+// +55 automático (assume BR se não vier DDI)
+// Ex.: "47997394479" -> "5547997394479"; "5547997394479" mantém.
+function normalizePhoneBR(input) {
+  const d = String(input || "").replace(/\D+/g, "");
+  if (!d) return "";
+  if (/^55\d{10,13}$/.test(d)) return d;       // já está com 55
+  if (/^\d{10,11}$/.test(d)) return "55" + d;  // DDD+número
+  return d; // não mexe em outros formatos (ex.: outro país com DDI)
+}
 
 async function ensureSock(instanceName = "default") {
   let it = INST.get(instanceName);
@@ -82,18 +86,13 @@ async function ensureSock(instanceName = "default") {
   return it;
 }
 
-/* ============ ROTAS ============ */
-// health
+// Health/diag
 app.get("/", (_req, res) => res.json({ ok:true, service:"magnatazap-api" }));
-
-// estado simples
 app.get("/state", (req, res) => {
   const name = String(req.query.instanceName || "default");
   const it = INST.get(name);
   res.json({ ok:true, state: it?.state || "close", lastError: it?.lastError || null });
 });
-
-// diagnóstico completo
 app.get("/diag", (req, res) => {
   const name = String(req.query.instanceName || "default");
   const it = INST.get(name);
@@ -108,25 +107,24 @@ app.get("/diag", (req, res) => {
   });
 });
 
-// pareamento por CÓDIGO (8 letras) — phone em E.164 sem '+'
+// Pareamento por código (8 letras) — aceita número sem 55
 app.post("/pair", async (req, res) => {
   try {
-    const { instanceName = "default", phone } = req.body || {};
+    const { instanceName = "default" } = req.body || {};
+    const phone = normalizePhoneBR(req.body?.phone);
+
     if (!/^\d{12,15}$/.test(phone || "")) {
       return res.status(400).json({ ok:false, error:"phone inválido (E.164 sem '+'). Ex.: 554799999999" });
     }
 
-    // 1) garante socket
     let it = await ensureSock(instanceName);
 
-    // 2) se está close, recria
     if (it.state === "close" || !it.sock) {
       try { it.sock?.end?.(); } catch {}
       INST.delete(instanceName);
       it = await ensureSock(instanceName);
     }
 
-    // 3) espera sair de 'close'
     for (let i = 0; i < 25; i++) {
       if (it.state && it.state !== "close") break;
       await delay(300);
@@ -140,7 +138,6 @@ app.post("/pair", async (req, res) => {
       });
     }
 
-    // 4) pede o código com 1 retry se for Connection Closed
     let raw, lastErr = null;
     for (let t = 0; t < 2; t++) {
       try {
@@ -163,7 +160,6 @@ app.post("/pair", async (req, res) => {
       });
     }
 
-    // 5) normaliza p/ 8 chars
     const clean = String(raw).replace(/[^A-Za-z0-9]/g, "").toUpperCase();
     const code8 = clean.slice(0, 8);
     if (code8.length !== 8) {
@@ -181,5 +177,4 @@ app.post("/pair", async (req, res) => {
   }
 });
 
-/* ============ START ============ */
-app.listen(process.env.PORT || 8080, () => console.log("API ON"));
+app.listen(process.env.PORT || 3000, () => console.log("API ON"));

@@ -1,150 +1,74 @@
-// server.js — MagnataZap API (PIN + QR + KeepAlive)
-import 'dotenv/config';
-import express from 'express';
-import cors from 'cors';
-import fs from 'fs-extra';
-import path from 'path';
-import { makeWASocket, useMultiFileAuthState } from '@whiskeysockets/baileys';
-
-const PORT         = process.env.PORT || 3000;
-const API_KEY      = process.env.API_KEY || '';                 // defina no Render
-const SESSIONS_DIR = process.env.SESSIONS_DIR || './sessions';  // defina no Render
-
-await fs.ensureDir(SESSIONS_DIR);
+import express from "express";
+import fs from "fs";
+import path from "path";
+import makeWASocket, {
+  fetchLatestBaileysVersion,
+  useMultiFileAuthState
+} from "@whiskeysockets/baileys";
+import Pino from "pino";
 
 const app = express();
-app.use(cors());
-app.use(express.json({ limit: '8mb' }));
+app.use(express.json());
 
-// 🔐 Header simples de API Key
-app.use((req, res, next) => {
-  if (API_KEY && req.headers['apikey'] !== API_KEY) {
-    return res.status(401).json({ ok: false, error: 'unauthorized' });
-  }
-  next();
-});
+const logger = Pino({ level: "error" });
 
-// ===== core =====
-const instances = new Map();
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const SESSIONS_DIR = process.env.SESSIONS_DIR || "./sessions";
+fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 
-async function createInstance(name) {
-  const dir = path.join(SESSIONS_DIR, name);
-  await fs.ensureDir(dir);
-  const { state, saveCreds } = await useMultiFileAuthState(dir);
+const API_KEY = process.env.API_KEY || ""; // opcional
+if (API_KEY) {
+  app.use((req, res, next) => {
+    const k = req.headers["apikey"] || req.headers["x-api-key"];
+    if (k !== API_KEY) return res.status(401).json({ ok:false, error:"unauthorized" });
+    next();
+  });
+}
+
+const INST = new Map(); // instanceName -> { sock }
+
+async function ensureSock(instanceName = "default") {
+  let it = INST.get(instanceName);
+  if (it?.sock) return it;
+
+  const authDir = path.join(SESSIONS_DIR, instanceName);
+  fs.mkdirSync(authDir, { recursive: true });
+
+  const { state, saveCreds } = await useMultiFileAuthState(authDir);
+  const { version } = await fetchLatestBaileysVersion();
 
   const sock = makeWASocket({
+    version,
     auth: state,
     printQRInTerminal: false,
-    browser: ['MagnataZap', 'Chrome', '1.0'],
-    syncFullHistory: false
+    browser: ["MagnataZap", "Chrome", "1.0"],
+    logger
   });
 
-  const meta = { sock, stateDir: dir, status: 'connecting', lastQR: null, lastError: null };
-  instances.set(name, meta);
-
-  sock.ev.on('creds.update', saveCreds);
-  sock.ev.on('connection.update', (u) => {
-    if (u.qr) meta.lastQR = u.qr;
-    if (u.connection === 'open')  meta.status = 'open';
-    if (u.connection === 'close') meta.status = 'close';
-    if (u.lastDisconnect?.error)  meta.lastError = String(u.lastDisconnect.error?.message || u.lastDisconnect.error);
-  });
-
-  return meta;
+  sock.ev.on("creds.update", saveCreds);
+  it = { sock };
+  INST.set(instanceName, it);
+  return it;
 }
 
-async function getInstance(name, { forceNew = false } = {}) {
-  if (forceNew || !instances.has(name)) return createInstance(name);
-  const meta = instances.get(name);
-  const ws = meta?.sock?.ws;
-  const CLOSED = 3;
-  if (!ws || ws.readyState === CLOSED) return createInstance(name);
-  return meta;
-}
-
-// ===== endpoints =====
-
-// ping/saúde + keepalive (mantém a instância acordada no plano Free)
-app.get('/health', (_req, res) => res.json({ ok: true, up: true }));
-app.get('/keepalive', (_req, res) => res.json({ ok: true, t: Date.now() }));
-
-// cria/garante instância
-app.post('/instance/create', async (req, res) => {
+// === único endpoint que você realmente precisa: GERA O CÓDIGO REAL ===
+// phone deve vir em E.164 sem '+', ex.: 554799999999
+app.post("/pair", async (req, res) => {
   try {
-    const name = (req.body.instanceName || '').trim() || 'inst-' + Date.now();
-    const meta = await getInstance(name);
-    return res.json({ ok: true, instanceName: name, status: meta.status });
-  } catch (e) {
-    console.error('[CREATE]', e);
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
-  }
-});
-
-// gera PIN (pareamento por número)
-app.post('/instance/:name/pair', async (req, res) => {
-  try {
-    const phone = (req.body?.phone || '').replace(/\D/g, '');
-    if (!/^55\d{10,11}$/.test(phone)) {
-      return res.status(400).json({ ok: false, error: 'Formato inválido. Use 55 + DDD + número (ex.: 5547999999999).' });
+    const { instanceName = "default", phone } = req.body || {};
+    if (!/^\d{12,15}$/.test(phone || "")) {
+      return res.status(400).json({ ok:false, error:"phone E.164 sem '+', ex: 554799999999" });
     }
-
-    const name = req.params.name;
-    let meta = await getInstance(name);
-    await sleep(500);
-
-    let code;
-    try {
-      code = await meta.sock.requestPairingCode(phone);
-    } catch (err) {
-      console.error('[PAIR-TRY1]', err?.message || err);
-      meta = await getInstance(name, { forceNew: true });
-      await sleep(700);
-      code = await meta.sock.requestPairingCode(phone);
-    }
-    return res.json({ ok: true, pairingCode: String(code).toUpperCase() });
+    const { sock } = await ensureSock(instanceName);
+    const raw = await sock.requestPairingCode(phone);
+    const clean = String(raw).replace(/[^A-Za-z0-9]/g, "").toUpperCase();
+    const code8 = clean.slice(0, 8);
+    if (code8.length !== 8) return res.status(502).json({ ok:false, error:"falha ao obter 8 letras" });
+    res.json({ ok:true, code: code8, expiresIn: 60 });
   } catch (e) {
-    console.error('[PAIR-FATAL]', e);
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+    res.status(500).json({ ok:false, error: String(e?.message || e) });
   }
 });
 
-// QR fallback (mostra QR atual da sessão)
-app.get('/instance/:name/qr', async (req, res) => {
-  try {
-    const name = req.params.name;
-    const meta = await getInstance(name);
-    return res.json({ ok: true, qr: meta.lastQR || null, status: meta.status });
-  } catch (e) {
-    console.error('[QR]', e);
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
-  }
+app.listen(process.env.PORT || 8080, () => {
+  console.log("API ON");
 });
-
-// envio de texto
-app.post('/instance/:name/send', async (req, res) => {
-  try {
-    const name = req.params.name;
-    const to   = (req.body?.to || '').replace(/\D/g, '');
-    const text = (req.body?.text || '').toString();
-    if (!/^55\d{10,11}$/.test(to)) return res.status(400).json({ ok: false, error: 'Destino inválido (use 55 + DDD + número).' });
-
-    const meta = await getInstance(name);
-    const jid = `${to}@s.whatsapp.net`;
-    const r = await meta.sock.sendMessage(jid, { text });
-    return res.json({ ok: true, id: r?.key?.id || null });
-  } catch (e) {
-    console.error('[SEND]', e);
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
-  }
-});
-
-// status das instâncias
-app.get('/instance/fetchInstances', (_req, res) => {
-  const arr = [...instances.entries()].map(([name, m]) => ({
-    instanceName: name, status: m.status, lastError: m.lastError || null
-  }));
-  res.json(arr);
-});
-
-app.listen(PORT, () => console.log(`API WhatsApp on port ${PORT}`));

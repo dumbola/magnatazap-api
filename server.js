@@ -122,16 +122,31 @@ app.post("/instance/:name/pair", async (req, res) => {
   if (!/^\d{12,15}$/.test(phone || "")) {
     return res.status(400).json({ ok:false, error:"phone no formato E.164 sem '+', ex.: 5547..." });
   }
+
   const it = await ensureSock(name);
+
+  // aguarda até 5s a conexão sair de 'close' (connecting já é suficiente)
+  let tries = 5;
+  while (tries-- > 0 && (it.state === "close" || !it.state)) {
+    await new Promise(r => setTimeout(r, 1000));
+  }
+  if (it.state === "close") {
+    return res.status(503).json({ ok:false, error:"instância indisponível (state=close). Tente novamente." });
+  }
+
   try {
-    const code = await it.sock.requestPairingCode(phone); // código REAL do WhatsApp
-    const clean = String(code).replace(/[^A-Za-z0-9]/g, "").toUpperCase();
-    const formatted = clean.length >= 8 ? clean.slice(0,8) : clean;
-    return res.json({ ok:true, code: formatted, expiresIn: 60 });
+    const raw = await it.sock.requestPairingCode(phone); // <- código REAL do WhatsApp
+    const clean = String(raw).replace(/[^A-Za-z0-9]/g, "").toUpperCase();
+    const code8 = clean.length >= 8 ? clean.slice(0, 8) : clean;
+    if (!code8 || code8.length !== 8) {
+      return res.status(502).json({ ok:false, error:"pareamento não retornou 8 letras. Tente novamente." });
+    }
+    return res.json({ ok:true, code: code8, expiresIn: 60 });
   } catch (e) {
     return res.status(400).json({ ok:false, error: e?.message || "falha ao gerar pairing code" });
   }
 });
+
 
 // keepalive opcional
 app.get("/keepalive", (_req, res) => res.json({ ok:true, ts: Date.now() }));

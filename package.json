@@ -3,9 +3,8 @@
   "version": "1.0.0",
   "type": "module",
   "main": "servidor.js",
-  "scripts": {
-    "start": "node servidor.js"
-  },
+  "scripts": { "start": "node servidor.js" },
+  "engines": { "node": ">=18.17 <=22" },       // importante no Render
   "dependencies": {
     "@whiskeysockets/baileys": "^6.7.7",
     "cors": "^2.8.5",

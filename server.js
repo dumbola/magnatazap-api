@@ -16,7 +16,8 @@ const SESSIONS_DIR = process.env.SESSIONS_DIR || "./sessions";
 const API_KEY = process.env.API_KEY || ""; // opcional
 
 fs.mkdirSync(SESSIONS_DIR, { recursive: true });
-const logger = Pino({ level: "error" });
+
+const logger = Pino({ level: "error" }); // ✓ apenas uma vez
 
 const app = express();
 app.use(cors({ origin: "*" }));
@@ -74,13 +75,17 @@ async function ensureSock(name) {
 
 // criar instância
 app.post("/instance/create", async (req, res) => {
-  const { instanceName } = req.body || {};
-  if (!instanceName) return res.status(400).json({ ok:false, error:"instanceName obrigatório" });
-  await ensureSock(instanceName);
-  return res.json({ ok:true, instanceName, status:"connecting" });
+  try {
+    const { instanceName } = req.body || {};
+    if (!instanceName) return res.status(400).json({ ok:false, error:"instanceName obrigatório" });
+    await ensureSock(instanceName);
+    return res.json({ ok:true, instanceName, status:"connecting" });
+  } catch (e) {
+    return res.status(500).json({ ok:false, error:String(e?.message||e), where:"create" });
+  }
 });
 
-// abrir conexão (mantém compat com seu front)
+// abrir conexão (compatível com seu front)
 app.post("/instance/connection/open", async (req, res) => {
   const { instanceName } = req.body || {};
   if (!instanceName) return res.status(400).json({ ok:false, error:"instanceName obrigatório" });

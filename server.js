@@ -1,150 +1,122 @@
-// server.js — MagnataZap API (PIN + QR + KeepAlive)
-import 'dotenv/config';
-import express from 'express';
-import cors from 'cors';
-import fs from 'fs-extra';
-import path from 'path';
-import { makeWASocket, useMultiFileAuthState } from '@whiskeysockets/baileys';
-
-const PORT         = process.env.PORT || 3000;
-const API_KEY      = process.env.API_KEY || '';                 // defina no Render
-const SESSIONS_DIR = process.env.SESSIONS_DIR || './sessions';  // defina no Render
-
-await fs.ensureDir(SESSIONS_DIR);
+import express from "express";
+import cors from "cors";
+import morgan from "morgan";
+import axios from "axios";
 
 const app = express();
-app.use(cors());
-app.use(express.json({ limit: '8mb' }));
+app.use(cors({ origin: "*"}));
+app.use(express.json({ limit: "1mb" }));
+app.use(morgan("dev"));
 
-// 🔐 Header simples de API Key
-app.use((req, res, next) => {
-  if (API_KEY && req.headers['apikey'] !== API_KEY) {
-    return res.status(401).json({ ok: false, error: 'unauthorized' });
-  }
-  next();
-});
+const UP = process.env.UPSTREAM_BASE;     // ex.: http://188.245.202.11:1111
+const API_KEY = process.env.API_KEY;
 
-// ===== core =====
-const instances = new Map();
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
-async function createInstance(name) {
-  const dir = path.join(SESSIONS_DIR, name);
-  await fs.ensureDir(dir);
-  const { state, saveCreds } = await useMultiFileAuthState(dir);
-
-  const sock = makeWASocket({
-    auth: state,
-    printQRInTerminal: false,
-    browser: ['MagnataZap', 'Chrome', '1.0'],
-    syncFullHistory: false
+// helper para chamar upstream com header correto
+async function up(method, path, data, params) {
+  const url = `${UP}${path}`;
+  const r = await axios({
+    method, url, data, params,
+    headers: {
+      "Content-Type": "application/json",
+      apikey: API_KEY,
+      "x-api-key": API_KEY,
+      "Authorization": `Bearer ${API_KEY}`,
+    },
+    timeout: 20000,
+    validateStatus: () => true
   });
-
-  const meta = { sock, stateDir: dir, status: 'connecting', lastQR: null, lastError: null };
-  instances.set(name, meta);
-
-  sock.ev.on('creds.update', saveCreds);
-  sock.ev.on('connection.update', (u) => {
-    if (u.qr) meta.lastQR = u.qr;
-    if (u.connection === 'open')  meta.status = 'open';
-    if (u.connection === 'close') meta.status = 'close';
-    if (u.lastDisconnect?.error)  meta.lastError = String(u.lastDisconnect.error?.message || u.lastDisconnect.error);
-  });
-
-  return meta;
+  return r;
 }
 
-async function getInstance(name, { forceNew = false } = {}) {
-  if (forceNew || !instances.has(name)) return createInstance(name);
-  const meta = instances.get(name);
-  const ws = meta?.sock?.ws;
-  const CLOSED = 3;
-  if (!ws || ws.readyState === CLOSED) return createInstance(name);
-  return meta;
-}
-
-// ===== endpoints =====
-
-// ping/saúde + keepalive (mantém a instância acordada no plano Free)
-app.get('/health', (_req, res) => res.json({ ok: true, up: true }));
-app.get('/keepalive', (_req, res) => res.json({ ok: true, t: Date.now() }));
-
-// cria/garante instância
-app.post('/instance/create', async (req, res) => {
-  try {
-    const name = (req.body.instanceName || '').trim() || 'inst-' + Date.now();
-    const meta = await getInstance(name);
-    return res.json({ ok: true, instanceName: name, status: meta.status });
-  } catch (e) {
-    console.error('[CREATE]', e);
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
-  }
+// --- Instâncias ---
+app.post("/instance/create", async (req, res) => {
+  const { instanceName, token } = req.body || {};
+  const body = { instanceName, token: token || instanceName };
+  const r = await up("post", "/instance/create", body);
+  return res.status(r.status).json(r.data);
 });
 
-// gera PIN (pareamento por número)
-app.post('/instance/:name/pair', async (req, res) => {
-  try {
-    const phone = (req.body?.phone || '').replace(/\D/g, '');
-    if (!/^55\d{10,11}$/.test(phone)) {
-      return res.status(400).json({ ok: false, error: 'Formato inválido. Use 55 + DDD + número (ex.: 5547999999999).' });
+// OPEN com fallback de rotas (connection/open -> :name/open -> /instance/open)
+app.post("/instance/connection/open", async (req, res) => {
+  const { instanceName } = req.body || {};
+  const tries = [
+    { m:"post", p:"/instance/connection/open", body:{ instanceName } },
+    { m:"post", p:`/instance/${encodeURIComponent(instanceName)}/open`, body:{} },
+    { m:"get",  p:`/instance/${encodeURIComponent(instanceName)}/open`, body:null },
+    { m:"post", p:"/instance/open", body:{ instanceName } },
+    { m:"post", p:`/instance/${encodeURIComponent(instanceName)}/connect`, body:{} },
+    { m:"post", p:"/instance/connect", body:{ instanceName } },
+  ];
+  for (const t of tries) {
+    const r = await up(t.m, t.p, t.body);
+    if (r.status < 400) return res.status(200).json(r.data || { ok:true });
+  }
+  return res.status(404).json({ ok:false, error:"Nenhuma rota OPEN aceita" });
+});
+
+// Pair por código (8 letras). Alguns provedores usam /pair, outros /connection/pairing/start
+app.post("/instance/:name/pair", async (req, res) => {
+  const name = req.params.name;
+  const { phone } = req.body || {};
+  const payloads = [
+    { p:`/instance/${encodeURIComponent(name)}/pair`, body:{ phone } },
+    { p:`/instance/connection/pairing/start`, body:{ instanceName:name, phone } },
+    { p:`/instance/${encodeURIComponent(name)}/pairing/start`, body:{ phone } },
+  ];
+  for (const t of payloads) {
+    const r = await up("post", t.p, t.body);
+    if (r.status < 400 && (r.data?.code || r.data?.pairingCode)) {
+      const code = (r.data.code || r.data.pairingCode || "").toUpperCase();
+      const expiresIn = r.data.expiresIn ?? 60;
+      return res.json({ ok:true, code, expiresIn });
     }
+  }
+  return res.status(400).json({ ok:false, error:"Falha ao gerar código de pareamento" });
+});
 
-    const name = req.params.name;
-    let meta = await getInstance(name);
-    await sleep(500);
-
-    let code;
-    try {
-      code = await meta.sock.requestPairingCode(phone);
-    } catch (err) {
-      console.error('[PAIR-TRY1]', err?.message || err);
-      meta = await getInstance(name, { forceNew: true });
-      await sleep(700);
-      code = await meta.sock.requestPairingCode(phone);
+// QR base64 (ou string)
+app.get("/instance/:name/qr", async (req, res) => {
+  const name = req.params.name;
+  const tries = [
+    { m:"get", p:`/instance/${encodeURIComponent(name)}/qr` },
+    { m:"get", p:`/instance/connection/qr`, params:{ instanceName:name, image:true } },
+  ];
+  for (const t of tries) {
+    const r = await up(t.m, t.p, null, t.params);
+    if (r.status < 400 && (r.data?.qr || r.data?.base64 || r.data?.image)) {
+      return res.json({ ok:true, qr: r.data.qr || r.data.base64 || r.data.image });
     }
-    return res.json({ ok: true, pairingCode: String(code).toUpperCase() });
-  } catch (e) {
-    console.error('[PAIR-FATAL]', e);
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
+  return res.status(400).json({ ok:false, error:"QR indisponível" });
 });
 
-// QR fallback (mostra QR atual da sessão)
-app.get('/instance/:name/qr', async (req, res) => {
-  try {
-    const name = req.params.name;
-    const meta = await getInstance(name);
-    return res.json({ ok: true, qr: meta.lastQR || null, status: meta.status });
-  } catch (e) {
-    console.error('[QR]', e);
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+// Estado
+app.get("/instance/connection/state", async (req, res) => {
+  const instanceName = req.query.instanceName;
+  const tries = [
+    { m:"get", p:`/instance/connection/state`, params:{ instanceName } },
+    { m:"get", p:`/instance/${encodeURIComponent(instanceName)}/state` },
+    { m:"get", p:`/instance/${encodeURIComponent(instanceName)}` },
+  ];
+  for (const t of tries) {
+    const r = await up(t.m, t.p, null, t.params);
+    if (r.status < 400) {
+      const state = r.data?.state || r.data?.status || r.data?.connectionStatus || "unknown";
+      return res.json({ ok:true, state });
+    }
   }
+  return res.status(404).json({ ok:false, error:"state não disponível" });
 });
 
-// envio de texto
-app.post('/instance/:name/send', async (req, res) => {
-  try {
-    const name = req.params.name;
-    const to   = (req.body?.to || '').replace(/\D/g, '');
-    const text = (req.body?.text || '').toString();
-    if (!/^55\d{10,11}$/.test(to)) return res.status(400).json({ ok: false, error: 'Destino inválido (use 55 + DDD + número).' });
-
-    const meta = await getInstance(name);
-    const jid = `${to}@s.whatsapp.net`;
-    const r = await meta.sock.sendMessage(jid, { text });
-    return res.json({ ok: true, id: r?.key?.id || null });
-  } catch (e) {
-    console.error('[SEND]', e);
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
-  }
+// Lista instâncias
+app.get("/instance/fetchInstances", async (_req, res) => {
+  const r = await up("get", "/instance/fetchInstances");
+  if (r.status < 400) return res.json(r.data);
+  return res.status(r.status).json(r.data);
 });
 
-// status das instâncias
-app.get('/instance/fetchInstances', (_req, res) => {
-  const arr = [...instances.entries()].map(([name, m]) => ({
-    instanceName: name, status: m.status, lastError: m.lastError || null
-  }));
-  res.json(arr);
-});
+// keepalive simples
+app.get("/keepalive", (_req, res) => res.json({ ok:true, ts: Date.now() }));
 
-app.listen(PORT, () => console.log(`API WhatsApp on port ${PORT}`));
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => console.log("API ON:", PORT));

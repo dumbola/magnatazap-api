@@ -82,34 +82,57 @@ app.get("/state", (req, res) => {
 });
 
 // === ENDPOINT PRINCIPAL: gera CÓDIGO REAL (8 letras) ===
-// phone em E.164 SEM '+', ex.: 554799999999
+const delay = (ms) => new Promise(r => setTimeout(r, ms));
+
+// Pair Code real (telefone E.164 sem '+', ex.: 554799999999)
 app.post("/pair", async (req, res) => {
   try {
     const { instanceName = "default", phone } = req.body || {};
     if (!/^\d{12,15}$/.test(phone || "")) {
-      return res.status(400).json({ ok:false, error:"phone inválido (E.164 sem '+'). Ex.: 554799999999" });
+      return res.status(400).json({ ok:false, error:"phone inválido (E.164 sem '+')" });
     }
 
-    const it = await ensureSock(instanceName);
+    // 1) garanta que existe um socket
+    let it = await ensureSock(instanceName);
 
-    // pequena espera se acabou de subir
-    let tries = 5;
-    while (tries-- > 0 && (it.state === "close" || !it.state)) {
-      await new Promise(r => setTimeout(r, 300));
+    // 2) se está 'close', recria a instância do zero
+    if (it.state === "close" || !it.sock) {
+      try { it.sock?.end?.(); } catch {}
+      INST.delete(instanceName);
+      it = await ensureSock(instanceName);
     }
-    if (it.state === "close") {
+
+    // 3) aguarde o socket sair de 'close' (até ~6s)
+    for (let i = 0; i < 20; i++) {
+      if (it.state && it.state !== "close") break;
+      await delay(300);
+    }
+    if (!it.state || it.state === "close") {
       return res.status(503).json({ ok:false, error:"instância indisponível (state=close). Tente novamente." });
     }
 
-    const raw = await it.sock.requestPairingCode(phone);
+    // 4) peça o CÓDIGO (tratando erro de 'Connection Closed' com 1 retry)
+    let raw;
+    try {
+      raw = await it.sock.requestPairingCode(phone);
+    } catch (e) {
+      if (String(e?.message || e).includes("Connection Closed")) {
+        await delay(500);
+        raw = await it.sock.requestPairingCode(phone); // retry
+      } else {
+        throw e;
+      }
+    }
+
+    // 5) normalize para 8 letras
     const clean = String(raw).replace(/[^A-Za-z0-9]/g, "").toUpperCase();
     const code8 = clean.slice(0, 8);
     if (code8.length !== 8) {
       return res.status(502).json({ ok:false, error:"pareamento não retornou 8 letras. Gere novamente." });
     }
-    res.json({ ok:true, code: code8, expiresIn: 60 });
+    return res.json({ ok:true, code: code8, expiresIn: 60 });
   } catch (e) {
-    res.status(500).json({ ok:false, error: String(e?.message || e) });
+    return res.status(500).json({ ok:false, error: String(e?.message || e) });
   }
 });
 

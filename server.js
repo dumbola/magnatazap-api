@@ -4,6 +4,13 @@ const { getFreshSession } = require('./sessions');
 const app = express();
 app.disable('x-powered-by');
 app.use(express.json({ limit: '256kb' }));
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
 
 // log básico
 app.use((req, res, next) => {
@@ -112,7 +119,7 @@ app.post('/pair', async (req, res) => {
 
 app.use((req,res)=> res.status(404).json({ ok:false, error:'not_found' }));
 
-const port = process.env.PORT || 3000;
-app.listen(port, '0.0.0.0', () => {
-  console.log(JSON.stringify({ level:'info', msg:'api_up', port }));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => logger.info({ msg: "api_up", port: PORT }));
+
 });

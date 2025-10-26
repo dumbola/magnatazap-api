@@ -1,28 +1,42 @@
-// sessions.js — Gerencia instâncias/sessões do Baileys
 const fs = require('fs');
 const path = require('path');
-const { useMultiFileAuthState } = require("@whiskeysockets/baileys");
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  fetchLatestBaileysVersion
+} = require('@whiskeysockets/baileys');
 
-async function getSession(instanceName) {
-  const { state, saveCreds } = await useMultiFileAuthState(`./sessions/${instanceName}`);
-  return { state, saveCreds };
-}
 const SESSIONS = new Map();
 
 async function removeDir(dir) {
   await fs.promises.rm(dir, { recursive: true, force: true }).catch(() => {});
 }
 
+async function resolveVersion(log) {
+  try {
+    const { version } = await fetchLatestBaileysVersion();
+    log && log(JSON.stringify({ level:'debug', msg:'wa_version_fetch_ok', version }));
+    return version;
+  } catch (err) {
+    const fallback = [2, 3000, 101];
+    log && log(JSON.stringify({ level:'warn', msg:'wa_version_fetch_fail_fallback', err:String(err), fallback }));
+    return fallback;
+  }
+}
+
 async function makeSocket(instanceName, log) {
   const authDir = path.join(process.cwd(), 'auth', instanceName);
   const { state, saveCreds } = await useMultiFileAuthState(authDir);
-  const { version } = await fetchLatestBaileysVersion();
+  const version = await resolveVersion(log);
 
   const sock = makeWASocket({
     version,
     auth: state,
     printQRInTerminal: false,
-    browser: ['MagnataZap', 'Chrome', '1.0']
+    browser: ['MagnataZap', 'Chrome', '1.0'],
+    markOnlineOnConnect: false,
+    syncFullHistory: false,
+    connectTimeoutMs: 25000
   });
 
   sock.ev.on('creds.update', saveCreds);
@@ -38,28 +52,17 @@ async function makeSocket(instanceName, log) {
     }));
   });
 
-  return { sock, authDir };
+  return { sock };
 }
 
-/**
- * Garante uma sessão "fresh" (não registrada) para poder solicitar pairing code.
- * Se já estiver registrada, faz logout e recria.
- */
 async function getFreshSession(instanceName, log) {
   if (SESSIONS.has(instanceName)) {
     const current = SESSIONS.get(instanceName);
-    // se houver user registrado, vamos forçar fresh abaixo
-    try {
-      if (current.sock?.user) {
-        log && log(JSON.stringify({ level: 'info', msg: 'logout_existing', instanceName }));
-        await current.sock.logout().catch(() => {});
-      }
-    } catch {}
+    try { if (current.sock?.user) await current.sock.logout().catch(()=>{}); } catch {}
     try { current.sock?.end?.(); } catch {}
     SESSIONS.delete(instanceName);
   }
 
-  // zera diretório de auth para evitar "already registered"
   const authDir = path.join(process.cwd(), 'auth', instanceName);
   await removeDir(authDir);
 

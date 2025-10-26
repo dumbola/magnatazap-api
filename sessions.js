@@ -1,12 +1,12 @@
 // sessions.js — Gerencia instâncias/sessões do Baileys
 const fs = require('fs');
 const path = require('path');
-const {
-  default: makeWASocket,
-  useMultiFileAuthState,
-  fetchLatestBaileysVersion
-} = require('@whiskeysockets/baileys');
+const { useMultiFileAuthState } = require("@whiskeysockets/baileys");
 
+async function getSession(instanceName) {
+  const { state, saveCreds } = await useMultiFileAuthState(`./sessions/${instanceName}`);
+  return { state, saveCreds };
+}
 const SESSIONS = new Map();
 
 async function removeDir(dir) {

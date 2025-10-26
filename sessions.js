@@ -13,7 +13,15 @@ async function removeDir(dir) {
 }
 
 async function resolveVersion(log) {
-  return [2, 3000, 1027934701]; // fallback estável
+  try {
+    const { version } = await fetchLatestBaileysVersion();
+    log && log(JSON.stringify({ level:'debug', msg:'wa_version_fetch_ok', version }));
+    return version;
+  } catch (err) {
+    const fallback = [2, 3000, 101];
+    log && log(JSON.stringify({ level:'warn', msg:'wa_version_fetch_fail_fallback', err:String(err), fallback }));
+    return fallback;
+  }
 }
 
 async function makeSocket(instanceName, log) {

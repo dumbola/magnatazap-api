@@ -7,6 +7,9 @@ function normalizePhoneToE164Digits(phone) {
   const d = String(phone || '').replace(/\D/g, '');
   return d.startsWith('55') ? d : '55' + d; // BR
 }
+const { state, saveCreds } = await getSession(instanceName);
+const sock = makeWASocket({ auth: state, ... });
+sock.ev.on("creds.update", saveCreds);
 
 function sha256(x) {
   return crypto.createHash('sha256').update(String(x)).digest('hex');

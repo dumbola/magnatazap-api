@@ -28,6 +28,15 @@ router.post('/pair', async (req, res) => {
     req.log.warn({ phone_masked: `**${phoneDigits.slice(-4)}` }, 'pair_invalid_phone');
     return res.status(422).json({ ok: false, error: 'invalid_phone' });
   }
+// dentro de pair.js
+const sock = makeWASocket({
+  version: [2,3000,1027934701],
+  printQRInTerminal: false,
+  browser: ["MagnataZap", "Chrome", "1.0"],
+  auth: state, // garanta que isso vem de useMultiFileAuthState
+  connectTimeoutMs: 25000, // aumente o timeout
+});
+await sleep(1000); // pequena pausa antes de requestPairingCode
 
   // gera code (⚙️ substitua pelo que sua lib WHATSAPP retorna, se aplicável)
   const code = genCode();

@@ -3,7 +3,7 @@ const path = require('path');
 const {
   default: makeWASocket,
   useMultiFileAuthState,
-  fetchLatestBaileysVersion
+  fetchLatestBaileysVersion,  
 } = require('@whiskeysockets/baileys');
 
 const SESSIONS = new Map();
